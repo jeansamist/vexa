@@ -183,6 +183,158 @@ const handleRedisMessage = async (message: string, channel: string, page: Page |
           } else {
                log("Page not available or closed, cannot send reconfigure command to browser.");
           }
+      } else if (command.action === 'playback') {
+        // Playback audio into the meeting using browser AudioContext queue
+        if (page && !page.isClosed()) {
+          try {
+            await page.evaluate(async (payload) => {
+              try {
+                (window as any).logBot?.(`[Playback] Received playback payload job=${payload?.job_id} chunk=${payload?.chunk_index}/${payload?.total_chunks}`);
+
+                // Lazy initialize playback mixer
+                const initMixer = async () => {
+                  if (!(window as any).__vexaPlayback) {
+                    (window as any).__vexaPlayback = {
+                      ac: new (window as any).AudioContext(),
+                      queue: [] as Array<{buffer: AudioBuffer, jobId: string|null}>,
+                      playing: false,
+                      gain: null as GainNode | null,
+                      merger: null as ChannelMergerNode | null,
+                      destination: null as MediaStreamAudioDestinationNode | null,
+                      micUnmuted: false,
+                      unmuteMicSelectors: [
+                        '[aria-label*="Turn on microphone"]',
+                        'button[aria-label*="Turn on microphone"]',
+                        '[aria-label*="Unmute"]',
+                        'button[aria-label*="Unmute"]'
+                      ],
+                      muteMicSelectors: [
+                        '[aria-label*="Turn off microphone"]',
+                        'button[aria-label*="Turn off microphone"]',
+                        '[aria-label*="Mute"]',
+                        'button[aria-label*="Mute"]'
+                      ]
+                    };
+                    const P = (window as any).__vexaPlayback;
+                    P.gain = P.ac.createGain();
+                    P.gain.gain.value = 1.0;
+                    P.destination = P.ac.createMediaStreamDestination();
+                    P.gain.connect(P.destination);
+                    try { await P.ac.resume(); } catch {}
+
+                    // Try to attach to any existing <audio>/<video> elements if needed
+                    try {
+                      const els = Array.from(document.querySelectorAll('audio,video')) as HTMLMediaElement[];
+                      els.forEach(el => {
+                        try { el.muted = false; el.volume = 1.0; el.play?.(); } catch {}
+                      });
+                    } catch {}
+
+                    // Best-effort: expose small helpers
+                    (window as any).__vexaPlaybackPlayNext = async () => {
+                      const P2 = (window as any).__vexaPlayback;
+                      if (!P2 || P2.playing) return;
+                      const item = P2.queue.shift();
+                      if (!item) { P2.playing = false; return; }
+                      P2.playing = true;
+                      const src = P2.ac.createBufferSource();
+                      src.buffer = item.buffer;
+                      src.connect(P2.gain!);
+                      src.onended = () => {
+                        P2.playing = false;
+                        (window as any).__vexaPlaybackPlayNext?.();
+                      };
+                      try { src.start(0); } catch {}
+                    };
+
+                    // mic control best-effort
+                    (window as any).__vexaPlaybackUnmuteMic = () => {
+                      const P3 = (window as any).__vexaPlayback;
+                      if (!P3) return;
+                      try {
+                        for (const sel of P3.unmuteMicSelectors) {
+                          const btn = document.querySelector(sel) as HTMLElement | null;
+                          if (btn) { btn.click(); P3.micUnmuted = true; break; }
+                        }
+                      } catch {}
+                    };
+                    (window as any).__vexaPlaybackMuteMic = () => {
+                      const P3 = (window as any).__vexaPlayback;
+                      if (!P3) return;
+                      try {
+                        for (const sel of P3.muteMicSelectors) {
+                          const btn = document.querySelector(sel) as HTMLElement | null;
+                          if (btn) { btn.click(); P3.micUnmuted = false; break; }
+                        }
+                      } catch {}
+                    };
+                  }
+                };
+
+                await initMixer();
+                const P = (window as any).__vexaPlayback;
+
+                // Decode base64 audio into AudioBuffer
+                const b64 = payload?.audio_b64 || '';
+                if (!b64 || typeof b64 !== 'string') return;
+                const binary = atob(b64);
+                const len = binary.length;
+                const bytes = new Uint8Array(len);
+                for (let i = 0; i < len; i++) bytes[i] = binary.charCodeAt(i);
+                const audioBuffer = await P.ac.decodeAudioData(bytes.buffer).catch(async () => {
+                  // Fallback: try to decode via <audio> element if decodeAudioData fails
+                  return await new Promise<AudioBuffer>((resolve, reject) => {
+                    try {
+                      const blob = new Blob([bytes.buffer], { type: 'audio/wav' });
+                      const url = URL.createObjectURL(blob);
+                      const el = new Audio();
+                      el.src = url;
+                      el.oncanplay = async () => {
+                        try {
+                          const ctx = P.ac;
+                          const rs = ctx.createMediaElementSource(el);
+                          rs.connect(P.gain!);
+                          await el.play().catch(() => {});
+                          // Not an AudioBuffer path, but at least it will play out
+                          resolve(ctx.createBuffer(1, 1, ctx.sampleRate));
+                        } catch (e) { reject(e as any); }
+                      };
+                      el.onerror = () => reject(new Error('media element decode failed'));
+                    } catch (e) { reject(e as any); }
+                  });
+                });
+
+                if (audioBuffer) {
+                  // Unmute mic before enqueue first item to ensure audio is sent into call if platform uses mic path
+                  try { (window as any).__vexaPlaybackUnmuteMic?.(); } catch {}
+                  P.queue.push({ buffer: audioBuffer, jobId: payload?.job_id || null });
+                  (window as any).__vexaPlaybackPlayNext?.();
+                }
+
+                // If this is the last chunk of a job and queue drains, optionally mute again
+                if (payload?.end === true) {
+                  // Poll until queue drained and not playing, then mute
+                  const tryMuteWhenIdle = () => {
+                    const Px = (window as any).__vexaPlayback;
+                    if (!Px) return;
+                    if (!Px.playing && Px.queue.length === 0) {
+                      try { (window as any).__vexaPlaybackMuteMic?.(); } catch {}
+                    } else {
+                      setTimeout(tryMuteWhenIdle, 300);
+                    }
+                  };
+                  setTimeout(tryMuteWhenIdle, 300);
+                }
+              } catch (err) {
+                (window as any).logBot?.(`[Playback] Error in browser playback: ${(err as any)?.message || err}`);
+              }
+            }, command);
+          } catch (err: any) {
+            log(`[Playback] Error delivering playback to page: ${err?.message}`);
+          }
+        } else {
+          log("Page not available or closed, cannot process playback command.");
+        }
       } else if (command.action === 'leave') {
         // Mark that a stop was requested via Redis
         stopSignalReceived = true;

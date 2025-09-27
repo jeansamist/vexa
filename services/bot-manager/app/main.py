@@ -238,6 +238,15 @@ class BotStatusChangePayload(BaseModel):
     failure_stage: Optional[MeetingFailureStage] = Field(None, description="Stage where failure occurred if applicable.")
     timestamp: Optional[str] = Field(None, description="Timestamp of the status change.")
 
+# --- Playback Request Model ---
+class PlaybackRequest(BaseModel):
+    """Request body for queueing audio playback to a running bot via Redis."""
+    audio_b64: str = Field(..., description="Base64-encoded audio data (prefer WAV/PCM16).")
+    job_id: Optional[str] = Field(None, description="Optional playback job identifier for client-side correlation.")
+    chunk_index: Optional[int] = Field(None, description="Optional chunk index if streaming in parts.")
+    total_chunks: Optional[int] = Field(None, description="Optional total number of chunks if known.")
+    end: Optional[bool] = Field(None, description="If true, marks this as the final chunk of the job.")
+
 # --- --------------------------------------------- ---
 
 @app.on_event("startup")
@@ -680,6 +689,90 @@ async def update_bot_config(
     # 4. Return 202 Accepted
     return {"message": "Reconfiguration request accepted and sent to the bot."}
 # -------------------------------------------
+
+# --- NEW Endpoint: Queue audio playback to an active bot ---
+@app.post("/playback/{platform}/{native_meeting_id}",
+          status_code=status.HTTP_202_ACCEPTED,
+          summary="Queue audio playback for an active bot",
+          description="Publishes audio playback jobs to the bot via Redis Pub/Sub so the bot can play the audio into the call.",
+          dependencies=[Depends(get_user_and_token)])
+async def queue_playback(
+    platform: Platform,
+    native_meeting_id: str,
+    req: PlaybackRequest,
+    auth_data: tuple[str, User] = Depends(get_user_and_token),
+    db: AsyncSession = Depends(get_db)
+):
+    global redis_client
+    user_token, current_user = auth_data
+
+    # Validate base64 payload is reasonably sized
+    if not isinstance(req.audio_b64, str) or len(req.audio_b64.strip()) == 0:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="audio_b64 is required")
+
+    # Resolve latest active or requested meeting to get session uid mapping
+    stmt = select(Meeting).where(
+        Meeting.user_id == current_user.id,
+        Meeting.platform == platform.value,
+        Meeting.platform_specific_id == native_meeting_id,
+        Meeting.status.in_([
+            MeetingStatus.ACTIVE.value,
+            MeetingStatus.JOINING.value,
+            MeetingStatus.AWAITING_ADMISSION.value,
+            MeetingStatus.REQUESTED.value
+        ])
+    ).order_by(desc(Meeting.created_at))
+
+    result = await db.execute(stmt)
+    meeting = result.scalars().first()
+    if not meeting:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No active or pending meeting found for playback")
+
+    # Find current session uid from Redis mapping, fallback to latest session
+    session_uid: Optional[str] = None
+    try:
+        if redis_client:
+            mapping_key = f"bm:meeting:{platform.value}:{native_meeting_id}:current_uid"
+            mapped = await redis_client.get(mapping_key)
+            if isinstance(mapped, str) and mapped:
+                session_uid = mapped
+    except Exception as e:
+        logger.warning(f"[Playback] Failed to read current_uid mapping: {e}")
+
+    if not session_uid:
+        latest_session_stmt = select(MeetingSession.session_uid).where(
+            MeetingSession.meeting_id == meeting.id
+        ).order_by(MeetingSession.session_start_time.desc()).limit(1)
+        sr = await db.execute(latest_session_stmt)
+        session_uid = sr.scalars().first()
+
+    if not session_uid:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Playback not possible: no active session UID")
+
+    if not redis_client:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Internal messaging unavailable")
+
+    # Construct playback command and publish to bot channel
+    command_channel = f"bot_commands:{session_uid}"
+    command_payload = {
+        "action": "playback",
+        "job_id": req.job_id,
+        "chunk_index": req.chunk_index,
+        "total_chunks": req.total_chunks,
+        "end": bool(req.end) if req.end is not None else None,
+        "audio_b64": req.audio_b64
+    }
+
+    try:
+        payload_str = json.dumps(command_payload)
+        await redis_client.publish(command_channel, payload_str)
+        logger.info(f"[Playback] Published playback command to {command_channel} job={req.job_id} chunk={req.chunk_index}/{req.total_chunks}")
+    except Exception as e:
+        logger.error(f"[Playback] Failed to publish playback command: {e}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to enqueue playback command")
+
+    return {"message": "Playback enqueued", "channel": command_channel, "job_id": req.job_id, "chunk_index": req.chunk_index}
+
 
 @app.delete("/bots/{platform}/{native_meeting_id}",
              status_code=status.HTTP_202_ACCEPTED,
