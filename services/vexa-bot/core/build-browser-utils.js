@@ -32,7 +32,8 @@ ${browserUtilsContent}
   window.VexaBrowserUtils = {
     BrowserAudioService: utils.BrowserAudioService,
     BrowserWhisperLiveService: utils.BrowserWhisperLiveService,
-    generateBrowserUUID: utils.generateBrowserUUID
+    generateBrowserUUID: utils.generateBrowserUUID,
+    initializePlaybackInjector: utils.initializePlaybackInjector
   };
 
   // Also expose performLeaveAction for platform-specific leave UX
@@ -61,5 +62,6 @@ console.log('📦 Bundle includes:');
 console.log('  - BrowserAudioService');
 console.log('  - BrowserWhisperLiveService');
 console.log('  - generateBrowserUUID');
+console.log('  - initializePlaybackInjector');
 console.log('  - window.VexaBrowserUtils');
 console.log('  - window.performLeaveAction');

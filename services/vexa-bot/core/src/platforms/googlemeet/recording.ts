@@ -150,6 +150,9 @@ export async function startGoogleRecording(page: Page, botConfig: BotConfig): Pr
       } catch {}
       // ---------------------------------------------
       
+      // Initialize playback injector to enable speaking into the call
+      try { browserUtils.initializePlaybackInjector?.(); } catch {}
+
       const audioService = new browserUtils.BrowserAudioService({
         targetSampleRate: 16000,
         bufferSize: 4096,

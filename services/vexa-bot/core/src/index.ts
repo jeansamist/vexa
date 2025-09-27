@@ -195,6 +195,39 @@ const handleRedisMessage = async (message: string, channel: string, page: Page |
         } else {
            log("Ignoring leave command: Already shutting down or page unavailable.")
         }
+      } else if (command.action === 'playback') {
+        // Forward playback chunk to browser playback injector
+        log("Received playback command; forwarding to browser injector");
+        if (page && !page.isClosed()) {
+          try {
+            const forwarded = await page.evaluate((payload) => {
+              try {
+                const pb = (window as any).__vexaPlayback;
+                if (!pb || typeof pb.queueChunk !== 'function') {
+                  console.warn('[Playback] Module not initialized in browser context');
+                  return false;
+                }
+                pb.queueChunk(payload);
+                if (typeof pb.ensureDrain === 'function') pb.ensureDrain();
+                return true;
+              } catch (e) {
+                console.error('[Playback] Error queuing chunk in browser:', (e as any)?.message || e);
+                return false;
+              }
+            }, {
+              job_id: command.job_id || null,
+              chunk_index: command.chunk_index ?? null,
+              total_chunks: command.total_chunks ?? null,
+              end: command.end ?? null,
+              audio_b64: command.audio_b64
+            });
+            log(`Playback forward ${forwarded ? 'succeeded' : 'failed'}`);
+          } catch (evalErr: any) {
+            log(`Error forwarding playback to browser: ${evalErr.message}`);
+          }
+        } else {
+          log('Page not available or closed; cannot forward playback command');
+        }
       }
   } catch (e: any) {
       log(`Error processing Redis message: ${e.message}`);

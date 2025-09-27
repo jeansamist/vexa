@@ -530,3 +530,170 @@ export class BrowserWhisperLiveService {
     }
   }
 }
+
+/**
+ * Browser-side playback injector to send queued audio into the call microphone.
+ * Exposes window.__vexaPlayback with queueChunk({audio_b64, job_id, chunk_index, total_chunks, end}) and ensureDrain().
+ */
+export function initializePlaybackInjector(): void {
+  try {
+    if ((window as any).__vexaPlayback && typeof (window as any).__vexaPlayback.queueChunk === 'function') {
+      return; // already initialized
+    }
+
+    // Light instrumentation to track RTCPeerConnections and senders
+    try {
+      if (!(window as any).peerConnections && typeof (window as any).RTCPeerConnection === 'function') {
+        (window as any).peerConnections = [];
+        const OrigPC = (window as any).RTCPeerConnection;
+        (window as any).RTCPeerConnection = function(...args: any[]) {
+          const pc = new (OrigPC as any)(...args);
+          try { (window as any).peerConnections.push(pc); } catch {}
+          return pc;
+        } as any;
+        // Preserve prototype
+        (window as any).RTCPeerConnection.prototype = OrigPC.prototype;
+      }
+    } catch {}
+
+    const state: any = {
+      audioContext: null as AudioContext | null,
+      destination: null as MediaStreamAudioDestinationNode | null,
+      source: null as AudioBufferSourceNode | null,
+      mediaStream: null as MediaStream | null,
+      // Queue of jobs: each job has array of AudioBuffer parts to play sequentially
+      jobBuffers: new Map<string, { buffers: AudioBuffer[]; expected: number | null; received: number; done: boolean }>(),
+      jobOrder: [] as string[],
+      playing: false,
+      senderReplaced: false,
+    };
+
+    const ensureContext = async () => {
+      if (!state.audioContext) state.audioContext = new AudioContext();
+      if (state.audioContext.state === 'suspended') {
+        try { await state.audioContext.resume(); } catch {}
+      }
+      if (!state.destination) state.destination = state.audioContext.createMediaStreamDestination();
+      if (!state.mediaStream) state.mediaStream = state.destination.stream;
+    };
+
+    const base64ToArrayBuffer = (b64: string): ArrayBuffer => {
+      const binary = atob(b64);
+      const len = binary.length;
+      const bytes = new Uint8Array(len);
+      for (let i = 0; i < len; i++) bytes[i] = binary.charCodeAt(i);
+      return bytes.buffer;
+    };
+
+    const decodeToBuffer = async (audio_b64: string): Promise<AudioBuffer> => {
+      await ensureContext();
+      const arr = base64ToArrayBuffer(audio_b64);
+      return await state.audioContext!.decodeAudioData(arr.slice(0));
+    };
+
+    const tryReplaceMicSender = async () => {
+      try {
+        const pc = (window as any).RTCPeerConnection && (window as any).__vexaPeerConnection ? (window as any).__vexaPeerConnection : null;
+        let senders: RTCRtpSender[] | null = null;
+        // Heuristic: try to discover an existing connection
+        if (!pc) {
+          const candidates = (window as any).peerConnections || [];
+          if (Array.isArray(candidates) && candidates.length) {
+            senders = candidates[0].getSenders?.() || null;
+          }
+        } else {
+          senders = pc.getSenders?.() || null;
+        }
+        if (!senders || !senders.length) return false;
+        const micSender = senders.find(s => s.track && s.track.kind === 'audio');
+        if (!micSender) return false;
+        await ensureContext();
+        const outgoingTrack = state.mediaStream!.getAudioTracks()[0];
+        if (!outgoingTrack) return false;
+        if ((micSender as any).replaceTrack) {
+          await (micSender as any).replaceTrack(outgoingTrack);
+          state.senderReplaced = true;
+          return true;
+        }
+        return false;
+      } catch {
+        return false;
+      }
+    };
+
+    const playNextBuffer = async (): Promise<void> => {
+      if (state.playing) return;
+      await ensureContext();
+
+      // Find the next available buffer across jobOrder
+      while (state.jobOrder.length > 0) {
+        const currentJobId = state.jobOrder[0];
+        const job = state.jobBuffers.get(currentJobId);
+        if (!job) { state.jobOrder.shift(); continue; }
+        if (job.buffers.length === 0) {
+          if (job.done || (job.expected !== null && job.received >= job.expected)) {
+            state.jobBuffers.delete(currentJobId);
+            state.jobOrder.shift();
+            continue;
+          } else {
+            // wait for more chunks for this job
+            return;
+          }
+        }
+
+        // There is a buffer to play
+        const buffer = job.buffers.shift()!;
+        try { await state.audioContext!.resume(); } catch {}
+        const src = state.audioContext!.createBufferSource();
+        src.buffer = buffer;
+        src.connect(state.destination!);
+        state.source = src;
+        state.playing = true;
+        src.onended = () => {
+          state.playing = false;
+          state.source = null;
+          // Continue with next buffer or job
+          setTimeout(() => { playNextBuffer().catch(() => {}); }, 0);
+        };
+        src.start();
+        // Attempt to hook to outgoing mic track once playback starts
+        if (!state.senderReplaced) {
+          tryReplaceMicSender().catch(() => {});
+        }
+        return; // actively playing
+      }
+      // Nothing to play
+    };
+
+    const queueChunk = async (payload: any) => {
+      const jobId: string = payload?.job_id || 'default';
+      const chunkIndex = payload?.chunk_index;
+      const total = payload?.total_chunks;
+      const end = !!payload?.end;
+      const b64: string = payload?.audio_b64;
+      if (!b64 || typeof b64 !== 'string') return;
+
+      try {
+        const buf = await decodeToBuffer(b64);
+        if (!state.jobBuffers.has(jobId)) {
+          state.jobBuffers.set(jobId, { buffers: [], expected: (typeof total === 'number' ? total : null), received: 0, done: false });
+          if (!state.jobOrder.includes(jobId)) state.jobOrder.push(jobId);
+        }
+        const job = state.jobBuffers.get(jobId)!;
+        job.buffers.push(buf);
+        job.received += 1;
+        if (end) job.done = true;
+      } catch (e) {
+        // ignore decode errors
+      }
+    };
+
+    const ensureDrain = () => {
+      playNextBuffer().catch(() => {});
+    };
+
+    (window as any).__vexaPlayback = { queueChunk, ensureDrain };
+  } catch (e) {
+    try { (window as any).logBot?.(`[Playback] Initialization error: ${(e as any)?.message || e}`); } catch {}
+  }
+}
