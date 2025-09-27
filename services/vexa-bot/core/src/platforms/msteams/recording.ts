@@ -59,7 +59,7 @@ export async function startTeamsRecording(page: Page, botConfig: BotConfig): Pro
       const selectorsTyped = selectors as any;
 
       // Use browser utility classes from the global bundle
-      const { BrowserAudioService, BrowserWhisperLiveService } = (window as any).VexaBrowserUtils;
+      const { BrowserAudioService, BrowserWhisperLiveService, initializePlaybackInjector } = (window as any).VexaBrowserUtils;
 
       // --- Early reconfigure wiring (event listener only) ---
       (window as any).__vexaPendingReconfigure = null;
@@ -75,6 +75,9 @@ export async function startTeamsRecording(page: Page, botConfig: BotConfig): Pro
       } catch {}
       // ---------------------------------------------
       
+      // Initialize playback injector so queued audio can be played into the call
+      try { initializePlaybackInjector?.(); } catch {}
+
       const audioService = new BrowserAudioService({
         targetSampleRate: 16000,
         bufferSize: 4096,
